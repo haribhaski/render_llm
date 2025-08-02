@@ -1,0 +1,13 @@
+setuptools
+wheel
+fastapi
+uvicorn
+google-generativeai
+python-dotenv
+requests
+numpy
+faiss-cpu
+nltk
+python-multipart
+PyMuPDF
+python-docx
