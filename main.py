@@ -7,6 +7,12 @@ from fastapi import Header, Depends
 from typing import Optional
 from pydantic import BaseModel
 import google.generativeai as genai
+import nltk
+
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab')
 
 INDEX_PATH = "index/faiss.index"
 CLAUSES_PATH = "index/clauses.pkl"
@@ -256,6 +262,7 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
 @app.get("/health")
 async def health():
     return {"status": "ok", "embedding_model": "Gemini", "engine": "FAISS"}
+
 
 
 
