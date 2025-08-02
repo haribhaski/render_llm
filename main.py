@@ -32,6 +32,11 @@ load_dotenv()
 # Initialize FastAPI
 app = FastAPI()
 
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab')
+    
 @app.get("/debug/pdf-functions")
 async def debug_pdf_functions():
     functions = [name for name, obj in inspect.getmembers(pdf, inspect.isfunction)]
@@ -251,6 +256,7 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
 @app.get("/health")
 async def health():
     return {"status": "ok", "embedding_model": "Gemini", "engine": "FAISS"}
+
 
 
 
