@@ -250,18 +250,28 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
 
     # 3. Use Gemini to answer each question
     answers = []
+    # 3. Use Gemini to answer each question
+    answers = []
     for question in req.questions:
         print(f"❓ Question: {question}")
         top_hits = search_engine.search(question, top_k=3)
         matched_clauses = [clause for clause, _ in top_hits]
         result = llm_reasoning_with_gemini(question, matched_clauses)
-        answers.append(result["answer"])
-
+        answer = result.get("answer", "")
+        if not isinstance(answer, str):
+            answer = str(answer)
+        answer = answer.strip()
+        if not answer:
+            answer = "No relevant information found."
+        answers.append(answer)
+    
     return {"answers": answers}
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "embedding_model": "Gemini", "engine": "FAISS"}
+
 
 
 
