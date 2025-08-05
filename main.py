@@ -257,11 +257,12 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
         result = llm_reasoning_with_gemini(question, matched_clauses)
         answers.append(result["answer"])
 
-    return RunResponse(answers=answers)
+    return {"answers": answers}
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "embedding_model": "Gemini", "engine": "FAISS"}
+
 
 
 
