@@ -231,7 +231,7 @@ async def handle_query(req: QueryRequest):
         raise HTTPException(status_code=500, detail=f"Failed to process query: {str(e)}")
 
 
-@app.post("/api/v1/hackrx/run", response_model=RunResponse)
+@app.post("/hackrx/run", response_model=RunResponse)
 async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
     try:
         # 1. Extract full text from single document
@@ -271,6 +271,7 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
 @app.get("/health")
 async def health():
     return {"status": "ok", "embedding_model": "Gemini", "engine": "FAISS"}
+
 
 
 
