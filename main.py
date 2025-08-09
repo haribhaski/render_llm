@@ -1,22 +1,19 @@
-# === main.py (updated) ===
+# === main.py (Pinecone Integrated + Gemini Reasoning) ===
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
 import os
 import json
 import re
 import inspect
 import nltk
 import google.generativeai as genai
-from dotenv import load_dotenv
 
-# ⬇️ FIX: use punkt (not punkt_tab)
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
+# Pinecone (serverless SDK)
+from pinecone import Pinecone
 
-# ------------ Local modules ------------
+# Local doc parsers
 from pdf import (
     extract_text_from_eml_file,
     extract_text_from_docx_file,
@@ -25,57 +22,36 @@ from pdf import (
 )
 import pdf
 
-# ⬇️ NEW: import the Pinecone-ready engine we wrote earlier.
-# Save that code as embeddings_engine.py next to this file.
-from embeddings_engine import (
-    create_search_engine,            # returns DocumentSearchEngine()
-    extract_and_create_clauses,      # smarter sentence-window chunking
-)
+# NLTK sentence tokenizer
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
 
-# ------------ Env & constants ------------
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ------------ Environment ------------
+# Render supplies these via os.environ (no .env imports)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_INDEX = os.environ.get("PINECONE_INDEX")            # e.g., "hackrx-rhwc8t2"
+PINECONE_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "default")
+
 if not GEMINI_API_KEY:
-    raise ValueError("❌ GEMINI_API_KEY not found. Add it to your .env file.")
-
-VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "pinecone").lower()  # 'pinecone' (default) or 'faiss'
-INDEX_PATH = "index/faiss.index"   # only used when VECTOR_BACKEND=faiss
-CLAUSES_PATH = "index/clauses.pkl" # only used when VECTOR_BACKEND=faiss
+    raise RuntimeError("GEMINI_API_KEY is not set in environment.")
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY is not set in environment.")
+if not PINECONE_INDEX:
+    raise RuntimeError("PINECONE_INDEX is not set in environment.")
 
 # ------------ App ------------
 app = FastAPI()
 
-@app.get("/debug/pdf-functions")
-async def debug_pdf_functions():
-    functions = [name for name, obj in inspect.getmembers(pdf, inspect.isfunction)]
-    return {"pdf_functions": functions}
+# ------------ Models ------------
+@dataclass
+class Clause:
+    id: str
+    text: str
+    metadata: Optional[Dict[str, Any]] = None
 
-# ------------ Gemini LLM for reasoning ------------
-# Keep using Pro for reasoning; use Flash if you want it cheaper.
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    reasoning_model = genai.GenerativeModel(model_name=os.getenv("GEMINI_TEXT_MODEL", "gemini-1.5-pro"))
-except Exception as e:
-    raise RuntimeError(f"❌ Failed to initialize Gemini LLM: {str(e)}")
-
-# ------------ Engine init ------------
-# ⬇️ NEW: create the Pinecone/FAISS-capable engine
-search_engine = create_search_engine()
-
-# ⬇️ Only try FAISS disk load if you actually use FAISS
-if VECTOR_BACKEND == "faiss" and os.path.exists(INDEX_PATH) and os.path.exists(CLAUSES_PATH):
-    print("📂 Loading existing FAISS index and clause data...")
-    # The new engine no longer exposes faiss_manager publicly; rebuild from disk is your responsibility.
-    # If you want persistent FAISS across runs, keep a small helper that loads vectors + meta and re-adds to index.
-    # For simplicity, we’ll defer and just rebuild per request when FAISS is used.
-    print("ℹ️ Skipping legacy direct load; engine will rebuild on demand.")
-else:
-    if VECTOR_BACKEND == "faiss":
-        print("⚠️ No saved FAISS index found. Will build from uploaded documents.")
-    else:
-        print("ℹ️ Using Pinecone backend — no local index to load.")
-
-# ------------ Schemas ------------
 class ClauseReference(BaseModel):
     id: str
     text: str
@@ -107,6 +83,49 @@ def verify_token(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=403, detail="Invalid token")
     return token
 
+# ------------ Pinecone client ------------
+def get_pinecone_index():
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    return pc.Index(PINECONE_INDEX)
+
+# ------------ Chunking (sentence windows) ------------
+def smart_sentence_chunks(
+    text: str,
+    doc_id: str,
+    max_words: int = 140,
+    stride: int = 2,
+) -> List[Clause]:
+    sents = [s.strip() for s in nltk.sent_tokenize(text) if s.strip()]
+    if not sents:
+        return []
+
+    chunks: List[Clause] = []
+    i = 0
+    chunk_id = 1
+    while i < len(sents):
+        cur = []
+        w = 0
+        j = i
+        while j < len(sents) and w < max_words:
+            cur.append(sents[j])
+            w += len(sents[j].split())
+            j += 1
+        chunk_text = " ".join(cur).strip()
+        meta = {"document_id": doc_id, "chunk_id": chunk_id, "start_sent": i, "end_sent": j - 1}
+        chunks.append(Clause(id=f"{doc_id}_{chunk_id}", text=chunk_text, metadata=meta))
+        chunk_id += 1
+        i = j - stride if (j - stride) > i else j
+    return chunks
+
+def extract_and_create_clauses(document_text: str, doc_id: str = "doc") -> List[Clause]:
+    chunks = smart_sentence_chunks(document_text, doc_id=doc_id, max_words=140, stride=2)
+    # Store full text in metadata to feed the LLM answerer and for UI
+    for c in chunks:
+        md = c.metadata or {}
+        md["text"] = c.text
+        c.metadata = md
+    return chunks
+
 # ------------ Document text extraction ------------
 def extract_text_from_document(doc_url: str) -> str:
     local_path = download_file(doc_url)
@@ -127,7 +146,10 @@ def extract_text_from_document(doc_url: str) -> str:
         except Exception:
             pass
 
-# ------------ Reasoning ------------
+# ------------ Gemini LLM for reasoning ------------
+genai.configure(api_key=GEMINI_API_KEY)
+reasoning_model = genai.GenerativeModel(model_name=os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"))
+
 def llm_reasoning_with_gemini(query: str, hits: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     hits: list of dicts like {"id": str, "score": float, "metadata": {"text": "...", ...}}
@@ -139,15 +161,14 @@ def llm_reasoning_with_gemini(query: str, hits: List[Dict[str, Any]]) -> Dict[st
             "clause_references": []
         }
 
-    # Build a compact context payload
-    clause_lines = []
+    parts = []
     for h in hits:
         cid = h.get("id", "")
         m = h.get("metadata", {}) or {}
         ctext = m.get("text", "")
-        clause_lines.append(f"Clause {cid}: {ctext}")
+        parts.append(f"Clause {cid}: {ctext}")
+    context = "\n".join(parts)
 
-    clause_texts = "\n".join(clause_lines)
     prompt = f"""
 You are an expert at answering questions from retrieved document chunks.
 
@@ -155,7 +176,7 @@ Query:
 {query}
 
 Relevant Chunks:
-{clause_texts}
+{context}
 
 Return ONLY valid JSON with exactly these keys:
 - "answer": string
@@ -172,7 +193,6 @@ Return ONLY valid JSON with exactly these keys:
             )
         )
         raw = (resp.text or "").strip()
-        # try strict json first
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
@@ -181,21 +201,12 @@ Return ONLY valid JSON with exactly these keys:
                 raise ValueError("No JSON object found in response.")
             data = json.loads(m.group(0))
 
-        # Normalize clause refs
-        out_refs = []
-        for h in hits:
-            # prefer model-provided list, else fall back to hits
-            pass
-        # If the model provided refs, keep them; if not, synthesize from hits
         if isinstance(data.get("clause_references"), list) and data["clause_references"]:
-            refs = []
-            for c in data["clause_references"]:
-                refs.append(ClauseReference(id=str(c.get("id", "")), text=str(c.get("text", ""))))
+            refs = [ClauseReference(id=str(c.get("id", "")), text=str(c.get("text", "")))
+                    for c in data["clause_references"]]
         else:
-            refs = [
-                ClauseReference(id=str(h.get("id", "")), text=str((h.get("metadata") or {}).get("text", "")))
-                for h in hits
-            ]
+            refs = [ClauseReference(id=str(h.get("id", "")), text=str((h.get("metadata") or {}).get("text", "")))
+                    for h in hits]
 
         return {
             "answer": str(data.get("answer", "")).strip(),
@@ -203,10 +214,9 @@ Return ONLY valid JSON with exactly these keys:
             "clause_references": refs
         }
     except Exception as e:
-        print("❌ LLM Reasoning Failed:", str(e))
-        # fall back: return concatenated chunk texts to help caller
+        # Fallback with retrieved chunks
         fallback_refs = [
-            ClauseReference(id=str(h.get("id","")), text=str((h.get("metadata") or {}).get("text","")))
+            ClauseReference(id=str(h.get("id", "")), text=str((h.get("metadata") or {}).get("text", "")))
             for h in hits
         ]
         return {"answer": "Could not generate answer.", "explanation": str(e), "clause_references": fallback_refs}
@@ -214,40 +224,53 @@ Return ONLY valid JSON with exactly these keys:
 # ------------ Routes ------------
 @app.get("/")
 async def root():
-    return {"message": f"✅ LLM Query API (Gemini + {VECTOR_BACKEND.upper()}) is live!"}
+    return {"message": "✅ LLM Query API (Gemini + Pinecone Integrated) is live!"}
+
+@app.get("/debug/pdf-functions")
+async def debug_pdf_functions():
+    functions = [name for name, obj in inspect.getmembers(pdf, inspect.isfunction)]
+    return {"pdf_functions": functions}
 
 @app.post("/api/v1/query", response_model=List[AnswerResponse])
 async def handle_query(req: QueryRequest):
     try:
-        # 1) Extract + chunk all docs
-        all_chunks = []
+        # 1) Extract & chunk all docs
+        all_chunks: List[Clause] = []
         for i, url in enumerate(req.documents):
             if not (isinstance(url, str) and url.startswith("http")):
                 raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
             print(f"📄 Processing document {i+1}: {url}")
             text = extract_text_from_document(url)
-            chunks = extract_and_create_clauses(text, f"doc_{i+1}")  # includes metadata["text"]
+            chunks = extract_and_create_clauses(text, f"doc_{i+1}")
             all_chunks.extend(chunks)
             print(f"✅ {len(chunks)} chunks extracted from document {i+1}")
 
         if not all_chunks:
             raise HTTPException(status_code=400, detail="No chunks extracted from any document.")
 
-        # 2) Build index (Pinecone or FAISS depending on env)
-        print(f"⚙️ Building {VECTOR_BACKEND.upper()} index with Gemini embeddings...")
-        search_engine.build(all_chunks)  # ⬅️ NEW
+        # 2) Upsert via Pinecone Integrated Embeddings (no vectors; top-level 'text' is embedded)
+        print("⚙️ Upserting with Pinecone Integrated Embeddings (llama-text-embed-v2, dim=1024)...")
+        index = get_pinecone_index()
+        records = []
+        for c in all_chunks:
+            md = dict(c.metadata or {})
+            records.append({"id": c.id, "text": c.text, "metadata": md})
+        B = 200
+        for s in range(0, len(records), B):
+            index.upsert_records(namespace=PINECONE_NAMESPACE, records=records[s:s+B])
 
+        # 3) Answer each question using Gemini
         results: List[AnswerResponse] = []
-        # 3) Answer each question
         for q in req.questions:
             print(f"❓ Query: {q}")
-            # engine.search returns list of (id, score, metadata)
-            raw_hits = search_engine.search(q, top_k=5, use_expansion=True, mmr_lambda=0.6)
-
-            # adapt to reasoning input (id + metadata["text"])
-            hits = [{"id": cid, "score": sc, "metadata": md} for (cid, sc, md) in raw_hits]
+            res = index.search(
+                namespace=PINECONE_NAMESPACE,
+                query={"inputs": {"text": q}, "top_k": 5},
+                include_metadata=True
+            )
+            hits = [{"id": m.id, "score": float(m.score), "metadata": dict(m.metadata or {})}
+                    for m in (res.matches or [])]
             r = llm_reasoning_with_gemini(q, hits)
-
             results.append(AnswerResponse(
                 query=q,
                 answer=r["answer"],
@@ -270,19 +293,33 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"❌ Failed to extract document text: {str(e)}")
 
-    # Chunk the single doc
+    # 1) Chunk the single doc
     chunks = extract_and_create_clauses(full_text, "submission_doc")
     if not chunks:
         raise HTTPException(status_code=400, detail="No chunks extracted from document.")
 
-    print(f"✂️ Extracted {len(chunks)} chunks. Embedding and indexing...")
-    search_engine.build(chunks)  # ⬅️ NEW
+    # 2) Upsert to Pinecone (integrated embeddings)
+    print(f"✂️ Extracted {len(chunks)} chunks. Upserting to Pinecone...")
+    index = get_pinecone_index()
+    records = []
+    for c in chunks:
+        md = dict(c.metadata or {})
+        records.append({"id": c.id, "text": c.text, "metadata": md})
+    B = 200
+    for s in range(0, len(records), B):
+        index.upsert_records(namespace=PINECONE_NAMESPACE, records=records[s:s+B])
 
+    # 3) Search & answer
     answers: List[str] = []
     for question in req.questions:
         print(f"❓ Question: {question}")
-        raw_hits = search_engine.search(question, top_k=5, use_expansion=True, mmr_lambda=0.6)
-        hits = [{"id": cid, "score": sc, "metadata": md} for (cid, sc, md) in raw_hits]
+        res = index.search(
+            namespace=PINECONE_NAMESPACE,
+            query={"inputs": {"text": question}, "top_k": 5},
+            include_metadata=True
+        )
+        hits = [{"id": m.id, "score": float(m.score), "metadata": dict(m.metadata or {})}
+                for m in (res.matches or [])]
         result = llm_reasoning_with_gemini(question, hits)
         ans = str(result.get("answer", "")).strip() or "No relevant information found."
         answers.append(ans)
@@ -291,5 +328,10 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "embedding_model": os.getenv("GEMINI_EMBED_MODEL", "models/embedding-001"),
-            "engine": VECTOR_BACKEND}
+    return {
+        "status": "ok",
+        "embedding_backend": "pinecone-integrated(llama-text-embed-v2)",
+        "pinecone_index": PINECONE_INDEX,
+        "namespace": PINECONE_NAMESPACE,
+        "llm": os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"),
+    }
