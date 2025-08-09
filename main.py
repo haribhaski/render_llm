@@ -236,7 +236,7 @@ Return ONLY valid JSON with exactly these keys:
         ]
         return {"answer": "Could not generate answer.", "explanation": str(e), "clause_references": fallback_refs}
 
-# ------------------ Helpers: build records ------------------
+# ------------------ Helpers: build/search/upsert ------------------
 def clause_to_record(c: Clause) -> Dict[str, Any]:
     """
     Pinecone Integrated Embeddings require FLAT records:
@@ -253,15 +253,22 @@ def clause_to_record(c: Clause) -> Dict[str, Any]:
         "end_sent": int(md.get("end_sent", 0)),
     }
 
-# ------------------ Pinecone search wrapper ------------------
+# Pinecone upsert batching (limit 96)
+PINECONE_MAX_BATCH = 96
+def upsert_in_batches(index, namespace: str, records: List[Dict[str, Any]]):
+    n = len(records)
+    if n == 0:
+        return
+    for s in range(0, n, PINECONE_MAX_BATCH):
+        chunk = records[s:s + PINECONE_MAX_BATCH]
+        index.upsert_records(namespace=namespace, records=chunk)
+
 def pinecone_search_text(index, namespace: str, text: str, top_k: int = 5):
     """
-    Use the minimal, schema-legal payload for your Pinecone server.
-    (Only 'inputs', 'top_k', 'vector', 'id', 'filter', 'match_terms' are allowed.)
+    Minimal, schema-legal payload for your Pinecone server.
     """
     payload = {"inputs": {"text": text}, "top_k": top_k}
     return index.search(namespace=namespace, query=payload)
-
 
 # ------------------ Routes ----------------------------
 @app.get("/")
@@ -294,9 +301,7 @@ async def handle_query(req: QueryRequest):
         print("⚙️ Upserting with Pinecone Integrated Embeddings (llama-text-embed-v2, dim=1024)...")
         index = get_pinecone_index()
         records = [clause_to_record(c) for c in all_chunks]
-        B = 200
-        for s in range(0, len(records), B):
-            index.upsert_records(namespace=PINECONE_NAMESPACE, records=records[s:s+B])
+        upsert_in_batches(index, PINECONE_NAMESPACE, records)
 
         # 3) Answer each question using Gemini
         results: List[AnswerResponse] = []
@@ -306,18 +311,13 @@ async def handle_query(req: QueryRequest):
             matches = res.matches or []
             hits = []
             for m in matches:
-                # Some deployments return fields under .metadata, some flatten, some omit
                 md = {}
                 if hasattr(m, "metadata") and m.metadata:
                     md = dict(m.metadata)
+                elif hasattr(m, "text"):
+                    md["text"] = getattr(m, "text")
                 else:
-                    # Try to recover text if it was flattened as a top-level field
-                    # (Some SDKs map all non-id fields into metadata automatically; if not, we at least avoid a crash)
-                    if hasattr(m, "text"):
-                        md["text"] = getattr(m, "text")
-                    else:
-                        md["text"] = ""  # final fallback
-            
+                    md["text"] = ""
                 hits.append({"id": m.id, "score": float(getattr(m, "score", 0.0)), "metadata": md})
 
             r = llm_reasoning_with_gemini(q, hits)
@@ -348,13 +348,11 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
     if not chunks:
         raise HTTPException(status_code=400, detail="No chunks extracted from document.")
 
-    # 2) Upsert to Pinecone (integrated embeddings) with FLAT records
+    # 2) Upsert to Pinecone (integrated embeddings) with FLAT records + 96-limit batching
     print(f"✂️ Extracted {len(chunks)} chunks. Upserting to Pinecone...")
     index = get_pinecone_index()
     records = [clause_to_record(c) for c in chunks]
-    B = 200
-    for s in range(0, len(records), B):
-        index.upsert_records(namespace=PINECONE_NAMESPACE, records=records[s:s+B])
+    upsert_in_batches(index, PINECONE_NAMESPACE, records)
 
     # 3) Search & answer
     answers: List[str] = []
@@ -364,18 +362,13 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
         matches = res.matches or []
         hits = []
         for m in matches:
-            # Some deployments return fields under .metadata, some flatten, some omit
             md = {}
             if hasattr(m, "metadata") and m.metadata:
                 md = dict(m.metadata)
+            elif hasattr(m, "text"):
+                md["text"] = getattr(m, "text")
             else:
-                # Try to recover text if it was flattened as a top-level field
-                # (Some SDKs map all non-id fields into metadata automatically; if not, we at least avoid a crash)
-                if hasattr(m, "text"):
-                    md["text"] = getattr(m, "text")
-                else:
-                    md["text"] = ""  # final fallback
-        
+                md["text"] = ""
             hits.append({"id": m.id, "score": float(getattr(m, "score", 0.0)), "metadata": md})
 
         result = llm_reasoning_with_gemini(question, hits)
@@ -393,5 +386,3 @@ async def health():
         "namespace": PINECONE_NAMESPACE,
         "llm": os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"),
     }
-
-
