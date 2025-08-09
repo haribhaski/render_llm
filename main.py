@@ -256,20 +256,16 @@ def clause_to_record(c: Clause) -> Dict[str, Any]:
 # ------------------ Pinecone search wrapper ------------------
 def pinecone_search_text(index, namespace: str, text: str, top_k: int = 5):
     """
-    Handles SDK variations gracefully. Always returns a response with .matches.
+    Always request metadata the correct way for current SDKs.
+    Falls back to no-include if an older SDK doesn't support it.
     """
-    # Preferred: include metadata inside request body
-    payload = {"inputs": {"text": text}, "top_k": top_k, "include_metadata": True}
+    payload = {"inputs": {"text": text}, "top_k": top_k, "include": {"metadata": True}}
     try:
         return index.search(namespace=namespace, query=payload)
     except TypeError:
-        # Some SDKs use 'include': {'metadata': True}
-        payload2 = {"inputs": {"text": text}, "top_k": top_k, "include": {"metadata": True}}
-        try:
-            return index.search(namespace=namespace, query=payload2)
-        except TypeError:
-            # Final fallback: no include flag (many SDKs return metadata by default)
-            return index.search(namespace=namespace, query={"inputs": {"text": text}, "top_k": top_k})
+        # Older client: try without include; most return metadata by default anyway
+        return index.search(namespace=namespace, query={"inputs": {"text": text}, "top_k": top_k})
+
 
 # ------------------ Routes ----------------------------
 @app.get("/")
@@ -371,3 +367,4 @@ async def health():
         "namespace": PINECONE_NAMESPACE,
         "llm": os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"),
     }
+
