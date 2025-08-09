@@ -51,13 +51,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_INDEX = os.environ.get("PINECONE_INDEX")              # e.g., "hackrx-rhwc8t2"
 PINECONE_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "default")
+PINECONE_HOST = os.environ.get("PINECONE_HOST")                # optional: direct host binding
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set in environment.")
 if not PINECONE_API_KEY:
     raise RuntimeError("PINECONE_API_KEY is not set in environment.")
-if not PINECONE_INDEX:
-    raise RuntimeError("PINECONE_INDEX is not set in environment.")
+if not (PINECONE_INDEX or PINECONE_HOST):
+    raise RuntimeError("Set PINECONE_INDEX or PINECONE_HOST in environment.")
 # ------------------------------------------------------------
 
 # ------------------ FastAPI app -----------------------------
@@ -103,11 +104,11 @@ def verify_token(authorization: Optional[str] = Header(None)):
 
 # ------------------ Pinecone client ------------------
 def get_pinecone_index():
-    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-    host = os.environ.get("PINECONE_HOST")
-    if host:
-        return pc.Index(host=host)     # binds directly, skips name lookup
-    return pc.Index(os.environ["PINECONE_INDEX"])
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    if PINECONE_HOST:
+        # Direct host binding (skips name lookup; avoids 404 if name not visible)
+        return pc.Index(host=PINECONE_HOST)
+    return pc.Index(PINECONE_INDEX)
 
 # ------------------ Chunking -------------------------
 def smart_sentence_chunks(
@@ -235,6 +236,24 @@ Return ONLY valid JSON with exactly these keys:
         ]
         return {"answer": "Could not generate answer.", "explanation": str(e), "clause_references": fallback_refs}
 
+# ------------------ Helpers: build records ------------------
+def clause_to_record(c: Clause) -> Dict[str, Any]:
+    """
+    Pinecone Integrated Embeddings require FLAT records:
+    - top-level 'id' and 'text'
+    - any extra fields must be primitive types or list[str]
+    """
+    md = dict(c.metadata or {})
+    return {
+        "id": c.id,
+        "text": c.text,  # field that is embedded by Pinecone (per field_map)
+        "document_id": str(md.get("document_id", "")),
+        "chunk_id": int(md.get("chunk_id", 0)),
+        "start_sent": int(md.get("start_sent", 0)),
+        "end_sent": int(md.get("end_sent", 0)),
+        # add more primitives if you need them (no nested dicts)
+    }
+
 # ------------------ Routes ----------------------------
 @app.get("/")
 async def root():
@@ -265,7 +284,7 @@ async def handle_query(req: QueryRequest):
         # 2) Upsert via Pinecone Integrated Embeddings (top-level 'text' is embedded)
         print("⚙️ Upserting with Pinecone Integrated Embeddings (llama-text-embed-v2, dim=1024)...")
         index = get_pinecone_index()
-        records = [{"id": c.id, "text": c.text, "metadata": dict(c.metadata or {})} for c in all_chunks]
+        records = [clause_to_record(c) for c in all_chunks]
         B = 200
         for s in range(0, len(records), B):
             index.upsert_records(namespace=PINECONE_NAMESPACE, records=records[s:s+B])
@@ -309,10 +328,10 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
     if not chunks:
         raise HTTPException(status_code=400, detail="No chunks extracted from document.")
 
-    # 2) Upsert to Pinecone (integrated embeddings)
+    # 2) Upsert to Pinecone (integrated embeddings) with FLAT records
     print(f"✂️ Extracted {len(chunks)} chunks. Upserting to Pinecone...")
     index = get_pinecone_index()
-    records = [{"id": c.id, "text": c.text, "metadata": dict(c.metadata or {})} for c in chunks]
+    records = [clause_to_record(c) for c in chunks]
     B = 200
     for s in range(0, len(records), B):
         index.upsert_records(namespace=PINECONE_NAMESPACE, records=records[s:s+B])
@@ -339,9 +358,7 @@ async def health():
     return {
         "status": "ok",
         "embedding_backend": "pinecone-integrated(llama-text-embed-v2)",
-        "pinecone_index": PINECONE_INDEX,
+        "pinecone_index": PINECONE_INDEX or PINECONE_HOST,
         "namespace": PINECONE_NAMESPACE,
         "llm": os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"),
     }
-
-
