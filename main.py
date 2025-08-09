@@ -103,8 +103,11 @@ def verify_token(authorization: Optional[str] = Header(None)):
 
 # ------------------ Pinecone client ------------------
 def get_pinecone_index():
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    return pc.Index("quickstart")
+    pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    host = os.environ.get("PINECONE_HOST")
+    if host:
+        return pc.Index(host=host)     # binds directly, skips name lookup
+    return pc.Index(os.environ["PINECONE_INDEX"])
 
 # ------------------ Chunking -------------------------
 def smart_sentence_chunks(
@@ -340,4 +343,5 @@ async def health():
         "namespace": PINECONE_NAMESPACE,
         "llm": os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"),
     }
+
 
