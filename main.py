@@ -256,15 +256,11 @@ def clause_to_record(c: Clause) -> Dict[str, Any]:
 # ------------------ Pinecone search wrapper ------------------
 def pinecone_search_text(index, namespace: str, text: str, top_k: int = 5):
     """
-    Always request metadata the correct way for current SDKs.
-    Falls back to no-include if an older SDK doesn't support it.
+    Use the minimal, schema-legal payload for your Pinecone server.
+    (Only 'inputs', 'top_k', 'vector', 'id', 'filter', 'match_terms' are allowed.)
     """
-    payload = {"inputs": {"text": text}, "top_k": top_k, "include": {"metadata": True}}
-    try:
-        return index.search(namespace=namespace, query=payload)
-    except TypeError:
-        # Older client: try without include; most return metadata by default anyway
-        return index.search(namespace=namespace, query={"inputs": {"text": text}, "top_k": top_k})
+    payload = {"inputs": {"text": text}, "top_k": top_k}
+    return index.search(namespace=namespace, query=payload)
 
 
 # ------------------ Routes ----------------------------
@@ -307,8 +303,23 @@ async def handle_query(req: QueryRequest):
         for q in req.questions:
             print(f"❓ Query: {q}")
             res = pinecone_search_text(index, PINECONE_NAMESPACE, q, top_k=5)
-            hits = [{"id": m.id, "score": float(m.score), "metadata": dict(m.metadata or {})}
-                    for m in (res.matches or [])]
+            matches = res.matches or []
+            hits = []
+            for m in matches:
+                # Some deployments return fields under .metadata, some flatten, some omit
+                md = {}
+                if hasattr(m, "metadata") and m.metadata:
+                    md = dict(m.metadata)
+                else:
+                    # Try to recover text if it was flattened as a top-level field
+                    # (Some SDKs map all non-id fields into metadata automatically; if not, we at least avoid a crash)
+                    if hasattr(m, "text"):
+                        md["text"] = getattr(m, "text")
+                    else:
+                        md["text"] = ""  # final fallback
+            
+                hits.append({"id": m.id, "score": float(getattr(m, "score", 0.0)), "metadata": md})
+
             r = llm_reasoning_with_gemini(q, hits)
             results.append(AnswerResponse(
                 query=q,
@@ -350,8 +361,23 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
     for question in req.questions:
         print(f"❓ Question: {question}")
         res = pinecone_search_text(index, PINECONE_NAMESPACE, question, top_k=5)
-        hits = [{"id": m.id, "score": float(m.score), "metadata": dict(m.metadata or {})}
-                for m in (res.matches or [])]
+        matches = res.matches or []
+        hits = []
+        for m in matches:
+            # Some deployments return fields under .metadata, some flatten, some omit
+            md = {}
+            if hasattr(m, "metadata") and m.metadata:
+                md = dict(m.metadata)
+            else:
+                # Try to recover text if it was flattened as a top-level field
+                # (Some SDKs map all non-id fields into metadata automatically; if not, we at least avoid a crash)
+                if hasattr(m, "text"):
+                    md["text"] = getattr(m, "text")
+                else:
+                    md["text"] = ""  # final fallback
+        
+            hits.append({"id": m.id, "score": float(getattr(m, "score", 0.0)), "metadata": md})
+
         result = llm_reasoning_with_gemini(question, hits)
         ans = str(result.get("answer", "")).strip() or "No relevant information found."
         answers.append(ans)
@@ -367,4 +393,5 @@ async def health():
         "namespace": PINECONE_NAMESPACE,
         "llm": os.environ.get("GEMINI_TEXT_MODEL", "gemini-1.5-pro"),
     }
+
 
