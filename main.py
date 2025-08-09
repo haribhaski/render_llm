@@ -251,8 +251,25 @@ def clause_to_record(c: Clause) -> Dict[str, Any]:
         "chunk_id": int(md.get("chunk_id", 0)),
         "start_sent": int(md.get("start_sent", 0)),
         "end_sent": int(md.get("end_sent", 0)),
-        # add more primitives if you need them (no nested dicts)
     }
+
+# ------------------ Pinecone search wrapper ------------------
+def pinecone_search_text(index, namespace: str, text: str, top_k: int = 5):
+    """
+    Handles SDK variations gracefully. Always returns a response with .matches.
+    """
+    # Preferred: include metadata inside request body
+    payload = {"inputs": {"text": text}, "top_k": top_k, "include_metadata": True}
+    try:
+        return index.search(namespace=namespace, query=payload)
+    except TypeError:
+        # Some SDKs use 'include': {'metadata': True}
+        payload2 = {"inputs": {"text": text}, "top_k": top_k, "include": {"metadata": True}}
+        try:
+            return index.search(namespace=namespace, query=payload2)
+        except TypeError:
+            # Final fallback: no include flag (many SDKs return metadata by default)
+            return index.search(namespace=namespace, query={"inputs": {"text": text}, "top_k": top_k})
 
 # ------------------ Routes ----------------------------
 @app.get("/")
@@ -293,11 +310,7 @@ async def handle_query(req: QueryRequest):
         results: List[AnswerResponse] = []
         for q in req.questions:
             print(f"❓ Query: {q}")
-            res = index.search(
-                namespace=PINECONE_NAMESPACE,
-                query={"inputs": {"text": q}, "top_k": 5},
-                include_metadata=True
-            )
+            res = pinecone_search_text(index, PINECONE_NAMESPACE, q, top_k=5)
             hits = [{"id": m.id, "score": float(m.score), "metadata": dict(m.metadata or {})}
                     for m in (res.matches or [])]
             r = llm_reasoning_with_gemini(q, hits)
@@ -340,11 +353,7 @@ async def run_submission(req: RunRequest, token: str = Depends(verify_token)):
     answers: List[str] = []
     for question in req.questions:
         print(f"❓ Question: {question}")
-        res = index.search(
-            namespace=PINECONE_NAMESPACE,
-            query={"inputs": {"text": question}, "top_k": 5},
-            include_metadata=True
-        )
+        res = pinecone_search_text(index, PINECONE_NAMESPACE, question, top_k=5)
         hits = [{"id": m.id, "score": float(m.score), "metadata": dict(m.metadata or {})}
                 for m in (res.matches or [])]
         result = llm_reasoning_with_gemini(question, hits)
