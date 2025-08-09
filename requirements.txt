@@ -11,3 +11,4 @@ nltk
 python-multipart
 PyMuPDF
 python-docx
+pinecone
